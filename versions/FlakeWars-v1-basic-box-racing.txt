@@ -1,0 +1,259 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { buildHexaflake } from '../lib/hexaflake'
+import { hsvToHex } from '../lib/tessellate/color'
+import { pointInPolygon } from '../lib/geom'
+
+// Board: a depth-2 hexaflake. Its 7 depth-1 branches are the 7 "boxes"
+// (49 cells, 7 boxes of 7) — the Sudoku constraint (no repeated value in a
+// box) falls straight out of the fractal's own recursive grouping, see
+// hexaflake.js. Values are 1-7, shared between both players — the contest
+// is over WHICH cells you get to fill, not separate color pools per side.
+const PAPER = '#eeeee6'
+const YOU_COLOR = '#cba24a'
+const AI_COLOR = '#7a5fa8'
+const BOX_SIZE = 7
+
+function digitPalette() {
+  const base = 0.58
+  return Array.from({ length: 7 }, (_, i) =>
+    hsvToHex(base + i / 7, 0.55 + 0.08 * (i % 2), 0.68 + 0.1 * ((i + 1) % 2)),
+  )
+}
+
+function groupByBox(tiles) {
+  const map = new Map()
+  tiles.forEach((t, i) => {
+    if (!map.has(t.box)) map.set(t.box, [])
+    map.get(t.box).push(i)
+  })
+  return map
+}
+
+function usedDigitsInBox(values, boxTiles) {
+  const used = new Set()
+  for (const i of boxTiles) if (values[i]) used.add(values[i])
+  return used
+}
+
+function legalDigits(values, boxTiles, tileIdx) {
+  if (values[tileIdx]) return []
+  const used = usedDigitsInBox(values, boxTiles)
+  const out = []
+  for (let d = 1; d <= BOX_SIZE; d++) if (!used.has(d)) out.push(d)
+  return out
+}
+
+function anyLegalMove(values, boxesByTile, boxes) {
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (values[i]) continue
+    if (legalDigits(values, boxes.get(boxesByTile[i]), i).length > 0) return true
+  }
+  return false
+}
+
+// Greedy AI: take an immediate box completion if one exists; otherwise play
+// into whichever box is closest to full (keeps pressure on, mirrors how a
+// person would actually contest territory) — no lookahead, deliberately.
+function chooseAiMove(values, boxesByTile, boxes) {
+  let best = null
+  let bestScore = -Infinity
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (values[i]) continue
+    const boxTiles = boxes.get(boxesByTile[i])
+    const digits = legalDigits(values, boxTiles, i)
+    const filledInBox = boxTiles.filter((j) => values[j]).length
+    for (const d of digits) {
+      const completes = filledInBox + 1 === BOX_SIZE
+      const score = (completes ? 1000 : 0) + filledInBox
+      if (score > bestScore) {
+        bestScore = score
+        best = { tileIdx: i, digit: d }
+      }
+    }
+  }
+  return best
+}
+
+function emptyBoard() {
+  return { values: {}, owners: {}, completedBy: {} }
+}
+
+function applyMove(board, tileIdx, digit, player, boxId, boxTiles) {
+  const values = { ...board.values, [tileIdx]: digit }
+  const owners = { ...board.owners, [tileIdx]: player }
+  const completedBy = { ...board.completedBy }
+  if (boxTiles.every((i) => values[i])) completedBy[boxId] = player
+  return { values, owners, completedBy }
+}
+
+export default function FlakeWars() {
+  const canvasRef = useRef(null)
+  const containerRef = useRef(null)
+  const [size, setSize] = useState({ w: 600, h: 600 })
+  const [board, setBoard] = useState(emptyBoard)
+  const [turn, setTurn] = useState('you')
+  const [gameOver, setGameOver] = useState(false)
+  const [activeDigit, setActiveDigit] = useState(1)
+  const [invalidTile, setInvalidTile] = useState(null)
+  const [round, setRound] = useState(0)
+  const colors = useMemo(digitPalette, [])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect
+      setSize({ w: Math.max(1, Math.round(width)), h: Math.max(1, Math.round(height)) })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const r = Math.max(30, Math.min(size.w, size.h) * 0.42)
+  const tiles = useMemo(
+    () => buildHexaflake(size.w / 2, size.h / 2, r, 2),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [r, size.w, size.h, round],
+  )
+  const boxes = useMemo(() => groupByBox(tiles), [tiles])
+  const boxesByTile = useMemo(() => tiles.map((t) => t.box), [tiles])
+
+  const cellsOwned = { you: 0, ai: 0 }
+  for (const p of Object.values(board.owners)) cellsOwned[p]++
+  const boxesWon = { you: 0, ai: 0 }
+  for (const p of Object.values(board.completedBy)) boxesWon[p]++
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = size.w * dpr
+    canvas.height = size.h * dpr
+    canvas.style.width = size.w + 'px'
+    canvas.style.height = size.h + 'px'
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    ctx.fillStyle = PAPER
+    ctx.fillRect(0, 0, size.w, size.h)
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i]
+      ctx.beginPath()
+      ctx.moveTo(t.verts[0][0], t.verts[0][1])
+      for (let k = 1; k < t.verts.length; k++) ctx.lineTo(t.verts[k][0], t.verts[k][1])
+      ctx.closePath()
+      const v = board.values[i]
+      ctx.fillStyle = v ? colors[v - 1] : '#ffffff'
+      ctx.fill()
+
+      const owner = board.owners[i]
+      if (invalidTile === i) {
+        ctx.strokeStyle = '#c0453f'
+        ctx.lineWidth = 3
+      } else if (owner) {
+        ctx.strokeStyle = owner === 'you' ? YOU_COLOR : AI_COLOR
+        ctx.lineWidth = 2.5
+      } else {
+        ctx.strokeStyle = 'rgba(32,34,44,0.25)'
+        ctx.lineWidth = 1
+      }
+      ctx.stroke()
+    }
+  }, [tiles, board, size, colors, invalidTile])
+
+  function aiTurn(currentBoard) {
+    const move = chooseAiMove(currentBoard.values, boxesByTile, boxes)
+    if (!move) {
+      setGameOver(true)
+      return
+    }
+    const boxTiles = boxes.get(boxesByTile[move.tileIdx])
+    const next = applyMove(currentBoard, move.tileIdx, move.digit, 'ai', boxesByTile[move.tileIdx], boxTiles)
+    setBoard(next)
+    if (!anyLegalMove(next.values, boxesByTile, boxes)) {
+      setGameOver(true)
+    } else {
+      setTurn('you')
+    }
+  }
+
+  useEffect(() => {
+    if (turn !== 'ai' || gameOver) return
+    const t = setTimeout(() => aiTurn(board), 500)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver])
+
+  function handlePick(e) {
+    if (turn !== 'you' || gameOver) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    for (let i = tiles.length - 1; i >= 0; i--) {
+      if (!pointInPolygon([x, y], tiles[i].verts)) continue
+      if (board.values[i]) return
+      const boxId = boxesByTile[i]
+      const boxTiles = boxes.get(boxId)
+      if (!legalDigits(board.values, boxTiles, i).includes(activeDigit)) {
+        setInvalidTile(i)
+        setTimeout(() => setInvalidTile(null), 300)
+        return
+      }
+      const next = applyMove(board, i, activeDigit, 'you', boxId, boxTiles)
+      setBoard(next)
+      if (!anyLegalMove(next.values, boxesByTile, boxes)) {
+        setGameOver(true)
+      } else {
+        setTurn('ai')
+      }
+      return
+    }
+  }
+
+  function newGame() {
+    setBoard(emptyBoard())
+    setTurn('you')
+    setGameOver(false)
+    setRound((n) => n + 1)
+  }
+
+  const winner =
+    gameOver && (cellsOwned.you !== cellsOwned.ai ? (cellsOwned.you > cellsOwned.ai ? 'you' : 'ai') : 'draw')
+
+  return (
+    <div className="mode rosette-mode">
+      <div className="canvas-wrap" ref={containerRef}>
+        <canvas ref={canvasRef} onPointerDown={handlePick} />
+        {gameOver && (
+          <div className="complete-banner">
+            <span>
+              {winner === 'draw' ? 'Draw' : winner === 'you' ? 'You win' : 'AI wins'} — {cellsOwned.you} to {cellsOwned.ai}
+            </span>
+            <button onClick={newGame}>New game</button>
+          </div>
+        )}
+      </div>
+      <div className="controls">
+        <div className="status-row">
+          <span className="seed-name">{gameOver ? 'Game over' : turn === 'you' ? 'Your move' : 'AI thinking…'}</span>
+          <span className="progress">
+            cells {cellsOwned.you}-{cellsOwned.ai} · boxes {boxesWon.you || 0}-{boxesWon.ai || 0}
+          </span>
+          <button className="text-btn" onClick={newGame}>New game</button>
+        </div>
+        <div className="palette-bar">
+          {colors.map((c, i) => (
+            <button
+              key={c}
+              className={'swatch' + (i + 1 === activeDigit ? ' active' : '')}
+              style={{ background: c }}
+              aria-label={`Value ${i + 1}`}
+              onClick={() => setActiveDigit(i + 1)}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}

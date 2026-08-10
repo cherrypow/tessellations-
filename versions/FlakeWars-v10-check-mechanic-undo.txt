@@ -1,0 +1,573 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { buildHexaflakeRing, buildAdjacency } from '../lib/hexaflake'
+import { hsvToHex } from '../lib/tessellate/color'
+import { pointInPolygon } from '../lib/geom'
+
+// The board's numbers are fixed at generation — every cell gets a value
+// before play starts and it never changes. A turn is "which cell do I
+// claim," never "what do I write here." Values are public from move one,
+// so the game is spatial: see the whole board, fight over which cells
+// matter, deny the opponent one if you have to.
+//
+// Generation respects the Sudoku shape (each of the 7 boxes — one
+// hexaflake branch's 7 leaf children, see hexaflake.js — gets a random
+// permutation of 1-7) purely so every value appears once per box.
+//
+// Scoring, in the box's own units:
+//   - claim a cell worth N -> N points.
+//   - bridge: two of your OWN cells, adjacent across a box boundary (never
+//     within one — every box already contains all of 1-7, so same-box
+//     neighbors are guaranteed to include complementary pairs that have
+//     nothing to do with cross-board position), with the same value or
+//     values summing to 8, AND alternating shade (dark<->light, never
+//     dark-dark or light-light) -> +10, on top of the two cells' own value.
+//   - own every cell in a box -> +15.
+//
+// No fork bonus here — tried "a cell touching 2+ of your bridges scores
+// extra" and caught it in verification before shipping: a bridge only
+// ever forms across the box-boundary graph, which is a PROVEN perfect
+// matching (see the chain/network note below) — every cell has at most
+// ONE cross-box neighbor, so no cell can EVER touch 2 bridges at once on
+// this board. Would've been permanent dead code reading 0-0 forever, same
+// mistake as the network bonus below. A real fork needs a different
+// definition (e.g. one claim that's simultaneously a bridge AND an
+// envelopment trigger elsewhere — those use different graphs, so it's
+// actually reachable) — not built yet.
+//
+// Check: is there a cell the opponent is one claim away from enveloping
+// (atRiskCell) right now? If it's your turn and yes, and your move
+// doesn't leave that cell claimed (by you directly, or swept up in your
+// own envelopment side effect), you take an 8-point penalty. Symmetric —
+// the AI is scored by the exact same function it evaluates its own
+// candidates with, so it can blunder into this too.
+//
+// Shade: each player's own claims alternate dark/light automatically by
+// that player's own move count (not global turn number) — your 1st claim
+// is dark, 2nd light, 3rd dark again. Bridges specifically require
+// alternating shade, not matching — a strategy layer on top of value
+// matching, since which shade your NEXT claim lands as isn't something you
+// choose directly. Enveloped cells (see below) never get a shade at all —
+// they weren't deliberately placed in the alternating sequence, so they
+// can never bridge, only contribute their value and box progress.
+//
+// Envelopment: after every claim, any UNCLAIMED cell touching 3 or more
+// same-owner neighbors (a strict majority over the other player, not just
+// "at least 3" — ties don't flip) auto-claims for that owner, for free,
+// locked from the other player forever. This can cascade — claiming one
+// cell can push a neighbor over the threshold too — so it runs as a
+// repeated pass to a fixed point, not a single scan.
+//
+// No chain/network bonus here on purpose: checked the actual adjacency
+// graph before building one, and the cross-box neighbor graph on this
+// 7-box layout is a perfect matching — every cell has at most ONE
+// cross-box neighbor (verified: 24 cells with exactly one, 25 with zero,
+// none with two-plus). A "connect 3+ bridges" bonus would be unreachable
+// dead code on this board; it needs a board where some cell can bridge in
+// two directions at once, which is a bigger-board/regrouping question, not
+// a scoring-formula one.
+const PAPER = '#eeeee6'
+const BRIDGE_COLOR = '#cba24a'
+const AI_HINT_COLOR = '#cba24a'
+const YOU_HINT_COLOR = '#8a5fd6'
+const BOX_SIZE = 7
+const SCORE_WEIGHTS = { bridge: 10, box: 15 }
+const CHECK_PENALTY = 8
+// Dark/light per player carries shade (turn-parity), used for bridge
+// eligibility. `enveloped` is a third, deliberately muted tone for cells
+// claimed via envelopment rather than a real alternating-sequence tap —
+// visually distinct so it reads as "won't bridge" at a glance.
+const SHADES = {
+  you: { dark: '#1e4a73', light: '#5b8fc4', enveloped: '#8fa8c2' },
+  ai: { dark: '#3a3c40', light: '#8b8e93', enveloped: '#b5b7ba' },
+}
+
+function nextShade(moveCount) {
+  return moveCount % 2 === 0 ? 'dark' : 'light'
+}
+// Fraction of AI moves that are its actual best evaluated move rather than
+// a random legal one. Measured by simulation against a non-targeting
+// opponent: 1.0 -> ~99.8% AI win rate, 0.45 -> still ~97%. Bridges and box
+// completions are precise, low-probability targets, so ANY nonzero amount
+// of calculated play crushes an opponent who isn't specifically aiming for
+// them — tuning this down doesn't scale linearly. 0.15 was the first
+// setting that landed somewhere fair (~60% AI win rate, ~10-point average
+// margin) rather than a wall.
+const AI_SKILL = 0.15
+
+function boxTint(boxId) {
+  const hue = (parseInt(boxId, 10) || 0) / 7
+  return hsvToHex(hue, 0.14, 0.99)
+}
+
+function groupByBox(tiles) {
+  const map = new Map()
+  tiles.forEach((t, i) => {
+    if (!map.has(t.box)) map.set(t.box, [])
+    map.get(t.box).push(i)
+  })
+  return map
+}
+
+function shuffle(arr) {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
+function countCrossBoxOpportunities(fixedValues, tiles, adj) {
+  let count = 0
+  const seen = new Set()
+  for (let i = 0; i < adj.length; i++) {
+    for (const j of adj[i]) {
+      if (tiles[i].box === tiles[j].box) continue
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (fixedValues[i] === fixedValues[j] || fixedValues[i] + fixedValues[j] === 8) count++
+    }
+  }
+  return count
+}
+
+// Random per-box permutation, rerolled (a handful of times, not forever) if
+// it happens to land zero cross-box opportunities — rare (~2% empirically)
+// but a board with nothing to fight over isn't worth dealing.
+function generateFixedValues(boxes, tiles, adj) {
+  let best = null
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const values = {}
+    for (const idxs of boxes.values()) {
+      const perm = shuffle([1, 2, 3, 4, 5, 6, 7])
+      idxs.forEach((idx, k) => { values[idx] = perm[k] })
+    }
+    if (countCrossBoxOpportunities(values, tiles, adj) > 0) return values
+    best = values
+  }
+  return best
+}
+
+// Every currently-valid bridge on the board, as an edge list — the single
+// source of truth both scoring and the AI's evaluation read from, so the
+// two can never quietly disagree with each other.
+function buildBridgeEdges(fixedValues, owners, shades, tiles, adj) {
+  const edges = []
+  const seen = new Set()
+  for (let i = 0; i < adj.length; i++) {
+    if (!owners[i]) continue
+    for (const j of adj[i]) {
+      if (tiles[i].box === tiles[j].box) continue
+      if (!owners[j] || owners[i] !== owners[j]) continue
+      if (!shades[i] || !shades[j] || shades[i] === shades[j]) continue
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`
+      if (seen.has(key)) continue
+      if (fixedValues[i] !== fixedValues[j] && fixedValues[i] + fixedValues[j] !== 8) continue
+      seen.add(key)
+      edges.push({ a: i, b: j, owner: owners[i] })
+    }
+  }
+  return edges
+}
+
+function computeScores(fixedValues, owners, completedBy, edges, penalties) {
+  const cellPoints = { you: 0, ai: 0 }
+  for (const [i, p] of Object.entries(owners)) cellPoints[p] += fixedValues[i]
+  const bridgeCount = { you: 0, ai: 0 }
+  for (const e of edges) bridgeCount[e.owner]++
+  const boxesWon = { you: 0, ai: 0 }
+  for (const p of Object.values(completedBy)) boxesWon[p]++
+  const total = (p) => cellPoints[p] + bridgeCount[p] * SCORE_WEIGHTS.bridge + boxesWon[p] * SCORE_WEIGHTS.box - (penalties[p] || 0)
+  return { cellPoints, bridgeCount, boxesWon, penalties, total: { you: total('you'), ai: total('ai') } }
+}
+
+// Repeated pass to a fixed point: any unclaimed cell with a strict
+// same-owner majority (>=3 AND more than the other player) among its
+// neighbors auto-claims. Cascades — one claim can trigger the next.
+function applyEnvelopment(owners, adj) {
+  let result = owners
+  let changed = true
+  while (changed) {
+    changed = false
+    const next = { ...result }
+    for (let i = 0; i < adj.length; i++) {
+      if (result[i]) continue
+      let you = 0, ai = 0
+      for (const n of adj[i]) {
+        if (result[n] === 'you') you++
+        else if (result[n] === 'ai') ai++
+      }
+      if (you >= 3 && you > ai) { next[i] = 'you'; changed = true }
+      else if (ai >= 3 && ai > you) { next[i] = 'ai'; changed = true }
+    }
+    result = next
+  }
+  return result
+}
+
+// The cell most at risk of falling to `owner` via envelopment — an empty
+// cell already touching 2 of their neighbors (one short of the 3-neighbor
+// threshold). NOT the same thing as biggestCascadeCell below: that finds
+// the cell you'd TAP to trigger a windfall (the trigger); this finds the
+// cell actually IN DANGER (the target) — claiming the target directly is
+// always a full defense, claiming the trigger might not be the same cell
+// at all. Check-penalty logic needs the target, not the trigger.
+function atRiskCell(owners, owner, boxesByTile, adj) {
+  let best = null
+  let bestCount = 0
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (owners[i]) continue
+    let count = 0
+    for (const n of adj[i]) if (owners[n] === owner) count++
+    if (count >= 2 && count > bestCount) {
+      bestCount = count
+      best = i
+    }
+  }
+  return best
+}
+
+// The SINGLE biggest envelopment-cascade opportunity for `forOwner` right
+// now — not every qualifying cell (there can be a dozen+ mid-game; only
+// the biggest is worth surfacing). Pure function of `owners` alone, so it
+// can run as a hypothetical without touching shade/box/penalty state —
+// used for the hint rings (offense: "tap here for a windfall").
+function biggestCascadeCell(owners, forOwner, boxesByTile, adj) {
+  const currentCount = Object.keys(owners).length
+  let best = null
+  let bestGain = 0
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (owners[i]) continue
+    const gain = Object.keys(applyEnvelopment({ ...owners, [i]: forOwner }, adj)).length - currentCount
+    if (gain > 1 && gain > bestGain) {
+      bestGain = gain
+      best = i
+    }
+  }
+  return best
+}
+
+function findEnvelopmentOpportunities(claims, boxesByTile, adj) {
+  return {
+    aiCell: biggestCascadeCell(claims.owners, 'ai', boxesByTile, adj),
+    youCell: biggestCascadeCell(claims.owners, 'you', boxesByTile, adj),
+  }
+}
+
+function simulateClaim(claims, tileIdx, player, boxes, boxesByTile, adj) {
+  const opponent = player === 'you' ? 'ai' : 'you'
+  // check: is there a cell the OPPONENT is one claim away from enveloping,
+  // right now, before this move? If it's still sitting there empty and
+  // vulnerable AFTER this move (below), you didn't defend it, penalize —
+  // but only the FIRST time this specific cell goes unaddressed. On a
+  // 91-cell board, ordinary clustering means some cell somewhere is
+  // almost always 2-neighbors-in; re-charging the same lingering cell
+  // every single turn it's not dealt with isn't "you blundered again,"
+  // it's just re-taxing old news. penalizedThreats makes each distinct
+  // threat cost once, not once per turn it's ignored.
+  const threatCell = atRiskCell(claims.owners, opponent, boxesByTile, adj)
+  const alreadyPenalized = threatCell != null && claims.penalizedThreats[threatCell]
+
+  const shade = nextShade(claims.moveCount[player])
+  const rawOwners = { ...claims.owners, [tileIdx]: player }
+  const owners = applyEnvelopment(rawOwners, adj)
+  const shades = { ...claims.shades, [tileIdx]: shade }
+  const moveCount = { ...claims.moveCount, [player]: claims.moveCount[player] + 1 }
+  const completedBy = { ...claims.completedBy }
+  for (const [boxId, boxTiles] of boxes) {
+    if (completedBy[boxId]) continue
+    if (!boxTiles.every((i) => owners[i])) continue
+    const first = owners[boxTiles[0]]
+    if (boxTiles.every((i) => owners[i] === first)) completedBy[boxId] = first
+  }
+
+  const penalties = { ...claims.penalties }
+  const penalizedThreats = { ...claims.penalizedThreats }
+  if (threatCell != null && !owners[threatCell] && !alreadyPenalized) {
+    penalties[player] = (penalties[player] || 0) + CHECK_PENALTY
+    penalizedThreats[threatCell] = true
+  }
+
+  return { owners, shades, moveCount, completedBy, penalties, penalizedThreats }
+}
+
+function scoreFor(fixedValues, claims, tiles, adj) {
+  const edges = buildBridgeEdges(fixedValues, claims.owners, claims.shades, tiles, adj)
+  return computeScores(fixedValues, claims.owners, claims.completedBy, edges, claims.penalties)
+}
+
+// AI evaluates every legal cell by the SAME formula the scoreboard uses:
+// the marginal points it gains by claiming here, plus half the marginal
+// points it would deny the human by taking this cell out from under them,
+// minus a penalty for leaving a box at 6/7 filled for the human to finish.
+// AI_SKILL of the time it plays this move; otherwise a random legal cell,
+// so it's a consistently stronger player without being unbeatable.
+function chooseAiMove(fixedValues, claims, boxesByTile, boxes, tiles, adj) {
+  const empties = boxesByTile.map((_, i) => i).filter((i) => !claims.owners[i])
+  if (empties.length === 0) return null
+  if (Math.random() > AI_SKILL) return empties[Math.floor(Math.random() * empties.length)]
+
+  const baseline = scoreFor(fixedValues, claims, tiles, adj)
+  let best = null
+  let bestScore = -Infinity
+  for (const i of empties) {
+    const boxId = boxesByTile[i]
+    const boxTiles = boxes.get(boxId)
+    const filledInBox = boxTiles.filter((j) => claims.owners[j]).length
+    const completes = filledInBox + 1 === BOX_SIZE
+    const gifts = !completes && filledInBox + 1 === BOX_SIZE - 1
+
+    const aiClaim = simulateClaim(claims, i, 'ai', boxes, boxesByTile, adj)
+    const aiGain = scoreFor(fixedValues, aiClaim, tiles, adj).total.ai - baseline.total.ai
+
+    const youClaim = simulateClaim(claims, i, 'you', boxes, boxesByTile, adj)
+    const denied = scoreFor(fixedValues, youClaim, tiles, adj).total.you - baseline.total.you
+
+    const score = aiGain + denied * 0.5 - (gifts ? 20 : 0)
+    if (score > bestScore) {
+      bestScore = score
+      best = i
+    }
+  }
+  return best
+}
+
+function centroidOf(verts) {
+  let x = 0, y = 0
+  for (const [px, py] of verts) { x += px; y += py }
+  return [x / verts.length, y / verts.length]
+}
+
+function textColorFor(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16)
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return luminance > 0.55 ? '#20222c' : '#f5f3ee'
+}
+
+function emptyClaims() {
+  return { owners: {}, shades: {}, moveCount: { you: 0, ai: 0 }, completedBy: {}, penalties: { you: 0, ai: 0 }, penalizedThreats: {} }
+}
+
+export default function FlakeWars() {
+  const canvasRef = useRef(null)
+  const containerRef = useRef(null)
+  const [size, setSize] = useState({ w: 600, h: 600 })
+  const [claims, setClaims] = useState(emptyClaims)
+  const [turn, setTurn] = useState('you')
+  const [gameOver, setGameOver] = useState(false)
+  const [round, setRound] = useState(0)
+  const [history, setHistory] = useState([])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect
+      setSize({ w: Math.max(1, Math.round(width)), h: Math.max(1, Math.round(height)) })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const r = Math.max(30, Math.min(size.w, size.h) * 0.42)
+  const tiles = useMemo(
+    () => buildHexaflakeRing(size.w / 2, size.h / 2, r, 2),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [r, size.w, size.h],
+  )
+  const boxes = useMemo(() => groupByBox(tiles), [tiles])
+  const boxesByTile = useMemo(() => tiles.map((t) => t.box), [tiles])
+  const adj = useMemo(() => buildAdjacency(tiles), [tiles])
+  const fixedValues = useMemo(
+    () => generateFixedValues(boxes, tiles, adj),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boxes, tiles, adj, round],
+  )
+  const edges = useMemo(() => buildBridgeEdges(fixedValues, claims.owners, claims.shades, tiles, adj), [fixedValues, claims, tiles, adj])
+  const scores = useMemo(
+    () => computeScores(fixedValues, claims.owners, claims.completedBy, edges, claims.penalties),
+    [fixedValues, claims, edges],
+  )
+  const cellsClaimed = Object.keys(claims.owners).length
+  const opportunities = useMemo(
+    () => findEnvelopmentOpportunities(claims, boxesByTile, adj),
+    [claims, boxesByTile, adj],
+  )
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = size.w * dpr
+    canvas.height = size.h * dpr
+    canvas.style.width = size.w + 'px'
+    canvas.style.height = size.h + 'px'
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    ctx.fillStyle = PAPER
+    ctx.fillRect(0, 0, size.w, size.h)
+
+    const centroids = tiles.map((t) => centroidOf(t.verts))
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i]
+      ctx.beginPath()
+      ctx.moveTo(t.verts[0][0], t.verts[0][1])
+      for (let k = 1; k < t.verts.length; k++) ctx.lineTo(t.verts[k][0], t.verts[k][1])
+      ctx.closePath()
+      const v = fixedValues[i]
+      const owner = claims.owners[i]
+      const shade = claims.shades[i] || 'enveloped'
+      const fill = owner ? SHADES[owner][shade] : boxTint(t.box)
+      ctx.fillStyle = fill
+      ctx.fill()
+
+      ctx.strokeStyle = 'rgba(32,34,44,0.25)'
+      ctx.lineWidth = 1
+      ctx.stroke()
+
+      const [cx, cy] = centroids[i]
+      const leafR = Math.hypot(t.verts[0][0] - cx, t.verts[0][1] - cy)
+
+      // hint rings: at most one gold (AI's single biggest cascade
+      // opportunity) and one purple (yours) — not every qualifying cell,
+      // which buried the signal in noise.
+      if (!owner && (opportunities.aiCell === i || opportunities.youCell === i)) {
+        ctx.lineWidth = 2.5
+        if (opportunities.aiCell === i) {
+          ctx.strokeStyle = AI_HINT_COLOR
+          ctx.beginPath()
+          ctx.arc(cx, cy, leafR * 0.82, 0, Math.PI * 2)
+          ctx.stroke()
+        }
+        if (opportunities.youCell === i) {
+          ctx.strokeStyle = YOU_HINT_COLOR
+          ctx.beginPath()
+          ctx.arc(cx, cy, leafR * 0.62, 0, Math.PI * 2)
+          ctx.stroke()
+        }
+      }
+
+      ctx.fillStyle = owner ? textColorFor(fill) : '#20222c'
+      ctx.font = `700 ${Math.round(leafR * 0.62)}px ui-monospace, "SF Mono", "Cascadia Code", monospace`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(String(v), cx, cy + leafR * 0.03)
+    }
+
+    // bridges drawn as visible connecting lines — the score should never
+    // require asking "why," it should be readable straight off the board
+    ctx.lineWidth = 3
+    ctx.lineCap = 'round'
+    for (const e of edges) {
+      const [ax, ay] = centroids[e.a]
+      const [bx, by] = centroids[e.b]
+      ctx.strokeStyle = BRIDGE_COLOR
+      ctx.globalAlpha = e.owner === 'you' ? 1 : 0.55
+      ctx.beginPath()
+      ctx.moveTo(ax, ay)
+      ctx.lineTo(bx, by)
+      ctx.stroke()
+    }
+    ctx.globalAlpha = 1
+  }, [tiles, fixedValues, claims, edges, opportunities, size])
+
+  function aiTurn(currentClaims) {
+    const tileIdx = chooseAiMove(fixedValues, currentClaims, boxesByTile, boxes, tiles, adj)
+    if (tileIdx == null) {
+      setGameOver(true)
+      return
+    }
+    setHistory((h) => [...h, { claims: currentClaims, turn: 'ai' }])
+    const next = simulateClaim(currentClaims, tileIdx, 'ai', boxes, boxesByTile, adj)
+    setClaims(next)
+    if (Object.keys(next.owners).length >= tiles.length) setGameOver(true)
+    else setTurn('you')
+  }
+
+  useEffect(() => {
+    if (turn !== 'ai' || gameOver) return
+    const t = setTimeout(() => aiTurn(claims), 500)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver])
+
+  function handleCanvasClick(e) {
+    if (turn !== 'you' || gameOver) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    for (let i = tiles.length - 1; i >= 0; i--) {
+      if (!pointInPolygon([x, y], tiles[i].verts)) continue
+      if (claims.owners[i]) return
+      setHistory((h) => [...h, { claims, turn: 'you' }])
+      const next = simulateClaim(claims, i, 'you', boxes, boxesByTile, adj)
+      setClaims(next)
+      if (Object.keys(next.owners).length >= tiles.length) setGameOver(true)
+      else setTurn('ai')
+      return
+    }
+  }
+
+  function undo() {
+    if (history.length === 0) return
+    const prev = history[history.length - 1]
+    setHistory((h) => h.slice(0, -1))
+    setClaims(prev.claims)
+    setTurn(prev.turn)
+    setGameOver(false)
+  }
+
+  function newGame() {
+    setClaims(emptyClaims())
+    setTurn('you')
+    setGameOver(false)
+    setHistory([])
+    setRound((n) => n + 1)
+  }
+
+  const winner = gameOver && (scores.total.you !== scores.total.ai ? (scores.total.you > scores.total.ai ? 'you' : 'ai') : 'draw')
+
+  return (
+    <div className="mode rosette-mode">
+      <div className="canvas-wrap" ref={containerRef}>
+        <canvas ref={canvasRef} onPointerDown={handleCanvasClick} />
+        {gameOver && (
+          <div className="complete-banner">
+            <span>
+              {winner === 'draw' ? 'Draw' : winner === 'you' ? 'You win' : 'AI wins'} — {scores.total.you} to {scores.total.ai}
+            </span>
+            <button onClick={newGame}>New game</button>
+          </div>
+        )}
+      </div>
+      <div className="controls">
+        <div className="status-row">
+          <span className="seed-name">{gameOver ? 'Game over' : turn === 'you' ? 'Your move' : 'AI thinking…'}</span>
+          <span className="progress">score {scores.total.you}-{scores.total.ai} · {cellsClaimed}/{tiles.length}</span>
+          <button className="text-btn" onClick={undo} disabled={history.length === 0}>Undo</button>
+          <button className="text-btn" onClick={newGame}>New game</button>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>value {scores.cellPoints.you}-{scores.cellPoints.ai}</span>
+          <span style={{ color: BRIDGE_COLOR }}>bridges {scores.bridgeCount.you}-{scores.bridgeCount.ai}</span>
+          <span>boxes {scores.boxesWon.you}-{scores.boxesWon.ai}</span>
+          <span style={{ color: '#c0453f' }}>checks {scores.penalties.you}-{scores.penalties.ai}</span>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>
+            Bridges (+10): same number, or <b>1↔7 · 2↔6 · 3↔5</b> (4 has no pair) — must cross a flower boundary AND alternate shade (dark↔light, never dark-dark).
+          </span>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>Envelopment: 3+ same-owner neighbors auto-claims a cell, free, forever.</span>
+          <span style={{ color: AI_HINT_COLOR }}>● gold = AI's move</span>
+          <span style={{ color: YOU_HINT_COLOR }}>● purple = yours</span>
+          <span>— ignore either and eat an 8pt check penalty.</span>
+        </div>
+      </div>
+    </div>
+  )
+}

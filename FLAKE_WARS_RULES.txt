@@ -1,0 +1,135 @@
+FLAKE WARS — RULES (v10)
+=========================
+
+THE BOARD
+---------
+- 13 "flowers," each a cluster of 7 hexagons (1 center + 6 petals) = 91
+  cells total. The flowers themselves are arranged in a hex pattern: 1
+  center flower, 6 flowers around it, and 6 more nestled in the gaps
+  between those (each of those 6 touches its two flower-neighbors, not
+  just one).
+- Every cell gets a number from 1-7 before play starts, generated once
+  and never changed. Each flower independently contains every number
+  1-7 exactly once (like a mini Sudoku box).
+- The whole board is visible and numbered from the very first move —
+  nothing is hidden. Unclaimed cells show a faint tint identifying
+  which flower they belong to.
+
+TURNS
+-----
+- You and the AI alternate. On your turn, tap any unclaimed cell to
+  claim it — its number becomes your points (see SCORING).
+- There is no "which number to place" — the number was already fixed
+  at generation. The only decision is which CELL to claim.
+- Undo steps back one move if you want to review what happened.
+
+SHADE
+-----
+- Each player's own claims alternate between two shades automatically,
+  based on THAT PLAYER'S own move count (not the global turn number):
+  your 1st claim is dark, 2nd is light, 3rd dark again, and so on.
+  Same for the AI, independently.
+- You do not choose your shade — it's forced by how many moves you've
+  made. This matters for bridges (below).
+- Cells claimed via Envelopment (see below) never get a shade at all,
+  since they weren't part of a deliberate alternating tap.
+
+BRIDGES (+10 points)
+---------------------
+A bridge forms between two of YOUR OWN cells when ALL of these hold:
+  1. They're adjacent across a FLOWER BOUNDARY (never two cells
+     within the same flower — every flower already contains all of
+     1-7, so same-flower neighbors are guaranteed to include numbers
+     that would "match" by coincidence; that's noise, not strategy).
+  2. Their numbers are the SAME, or they're a complementary pair:
+     1↔7, 2↔6, 3↔5. (4 has no partner — it can only bridge to
+     another 4.)
+  3. Their SHADES ALTERNATE — one dark, one light. Two dark cells (or
+     two light cells) do NOT bridge, even with matching numbers.
+- A completed bridge is drawn as a gold line directly connecting the
+  two cells, so it's always visible why points were scored.
+- Because shade is forced by move-count and not chosen, a bridge you're
+  building is telegraphed — the opponent can see it coming and has a
+  window to interfere before your shade cycles back around.
+
+BOX COMPLETION (+15 points)
+-----------------------------
+- Own all 7 cells in a single flower (by any mix of direct claims and
+  envelopment) and you get +15 for that flower.
+- If a flower ends up with mixed ownership when its last cell is
+  filled, nobody gets the bonus — it's genuinely contested, not
+  awarded to whoever happened to place last.
+
+ENVELOPMENT (free cells)
+--------------------------
+- After every move, any UNCLAIMED cell touching 3 or more of your
+  cells — a strict majority, more than the other player has touching
+  it — automatically becomes yours. Free, permanent, the other player
+  can never take it.
+- This can cascade: claiming one cell can push a neighboring cell over
+  the 3-neighbor threshold too, which can push another, and so on. It
+  resolves fully before the turn passes.
+- Enveloped cells never get a shade, so they can't participate in
+  bridges — only in value and box-completion scoring.
+- Hint rings show the SINGLE biggest envelopment opportunity currently
+  on the board for each side (not every cell that qualifies, which
+  buried the signal in noise on a 91-cell board):
+    - GOLD ring = the AI's best opportunity right now.
+    - PURPLE ring = yours.
+
+CHECK (-8 point penalty)
+--------------------------
+- If an empty cell already touches 2 of the OPPONENT'S cells (one
+  short of an envelopment), that cell is "at risk" — the opponent is
+  one claim away from taking it, one way or another.
+- If it's your turn and there's a cell at risk from the opponent, and
+  your move doesn't leave that specific cell claimed — either by you
+  directly, or swept up as a side effect of your own envelopment
+  cascade — you take an 8-point penalty.
+- Each distinct at-risk cell only ever costs this penalty ONCE. If you
+  ignore the same lingering threat on a later turn too, it doesn't
+  charge you again — the first miss is the one that counts.
+- This is symmetric: the AI evaluates every move through the same
+  scoring function you're scored with, so it can walk into this
+  penalty too if something else looks more valuable in the moment.
+
+SCORING SUMMARY
+-----------------
+Your total score =
+    (sum of the numbers on cells you own)
+  + 10 x (number of bridges you've formed)
+  + 15 x (flowers you've fully and solely completed)
+  - 8 x (distinct checks you've failed to answer)
+
+Highest total when the board fills wins. Ties are a draw.
+
+THE AI
+------
+- Evaluates every legal cell each turn by simulating the actual
+  outcome (including envelopment cascades and check penalties) and
+  comparing it to the current score — the exact same formula above,
+  not a separate heuristic.
+- It also weighs denying you a good cell (half credit for whatever it
+  would have been worth to you), and specifically avoids leaving a
+  flower at 6-of-7 filled unless it's the move that completes it
+  (handing you a free finish next turn is the single biggest unforced
+  error available).
+- It only plays its calculated best move some of the time (currently
+  15%) — the rest of the time it plays a random legal cell. This is
+  deliberate: even a small amount of calculated play overwhelms an
+  opponent who isn't specifically hunting for bridges/envelopment/
+  checks, so full-strength play produced a near-unbeatable AI in
+  testing. This setting can be tuned up or down.
+
+WHAT'S NOT IN HERE (tried and reverted)
+------------------------------------------
+- A "network/chain" bonus for connecting 3+ bridges in a row, and
+  later a "fork" bonus for one cell touching 2+ bridges at once — both
+  are mathematically impossible on this board. The cross-flower
+  neighbor graph is a proven perfect matching: every cell has at most
+  ONE neighbor in a different flower. No cell can ever be part of two
+  bridges simultaneously, so any bonus shaped like that is permanent
+  dead code. A real fork/network mechanic would need either a
+  different board topology, or a definition that combines DIFFERENT
+  systems on one cell (e.g. a move that's both a bridge AND an
+  envelopment trigger) rather than stacking two of the same thing.

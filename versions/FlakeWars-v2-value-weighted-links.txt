@@ -1,0 +1,324 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { buildHexaflake, buildAdjacency } from '../lib/hexaflake'
+import { hsvToHex } from '../lib/tessellate/color'
+import { pointInPolygon } from '../lib/geom'
+
+// Board: a depth-2 hexaflake, 49 cells in 7 independent boxes of 7 (see
+// hexaflake.js for why the box grouping falls straight out of the
+// recursion). Legality: standard Sudoku — a box may never repeat a value.
+//
+// That alone makes every game race through all 49 cells with no real
+// contest (verified by simulation), because boxes never interact. Two
+// scoring layers on top of the geometric neighbor graph (buildAdjacency)
+// are what create actual position value:
+//   - twin link: two SAME-owner cells, adjacent, with the SAME value.
+//   - balance link: two SAME-owner cells, adjacent, with values summing to 8
+//     (1↔7, 2↔6, 3↔5 — 4 has no partner).
+// Same-box neighbors can never trigger either (the Sudoku rule already
+// forbids matching values there), so every link is necessarily cross-box —
+// exactly the interaction the flat box-only version was missing.
+const PAPER = '#eeeee6'
+const YOU_COLOR = '#cba24a'
+const AI_COLOR = '#7a5fa8'
+const SELECT_COLOR = '#c0453f'
+const BOX_SIZE = 7
+const SCORE_WEIGHTS = { box: 10, twin: 15, balance: 8 }
+
+function digitPalette() {
+  const hue = 0.58
+  return Array.from({ length: 7 }, (_, i) => {
+    const t = i / 6
+    return hsvToHex(hue, 0.18 + t * 0.72, 0.97 - t * 0.42)
+  })
+}
+
+function groupByBox(tiles) {
+  const map = new Map()
+  tiles.forEach((t, i) => {
+    if (!map.has(t.box)) map.set(t.box, [])
+    map.get(t.box).push(i)
+  })
+  return map
+}
+
+function usedDigitsInBox(values, boxTiles) {
+  const used = new Set()
+  for (const i of boxTiles) if (values[i]) used.add(values[i])
+  return used
+}
+
+function legalDigits(values, boxTiles, tileIdx) {
+  if (values[tileIdx]) return []
+  const used = usedDigitsInBox(values, boxTiles)
+  const out = []
+  for (let d = 1; d <= BOX_SIZE; d++) if (!used.has(d)) out.push(d)
+  return out
+}
+
+function anyLegalMove(values, boxesByTile, boxes) {
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (values[i]) continue
+    if (legalDigits(values, boxes.get(boxesByTile[i]), i).length > 0) return true
+  }
+  return false
+}
+
+function linkPreview(cellIdx, digit, player, values, owners, adj) {
+  let twin = 0, balance = 0
+  for (const n of adj[cellIdx]) {
+    if (!values[n] || owners[n] !== player) continue
+    if (values[n] === digit) twin++
+    else if (values[n] + digit === 8) balance++
+  }
+  return { twin, balance }
+}
+
+function computeLinkTotals(values, owners, adj) {
+  const totals = { you: { twin: 0, balance: 0 }, ai: { twin: 0, balance: 0 } }
+  const seen = new Set()
+  for (let i = 0; i < adj.length; i++) {
+    if (!values[i]) continue
+    for (const j of adj[i]) {
+      if (!values[j] || owners[i] !== owners[j]) continue
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const p = owners[i]
+      if (values[i] === values[j]) totals[p].twin++
+      else if (values[i] + values[j] === 8) totals[p].balance++
+    }
+  }
+  return totals
+}
+
+function computeScores(values, owners, completedBy, links) {
+  const valueSum = { you: 0, ai: 0 }
+  for (const [i, v] of Object.entries(values)) valueSum[owners[i]] += v
+  const boxesWon = { you: 0, ai: 0 }
+  for (const p of Object.values(completedBy)) boxesWon[p]++
+  const total = (p) =>
+    valueSum[p] + boxesWon[p] * SCORE_WEIGHTS.box + links[p].twin * SCORE_WEIGHTS.twin + links[p].balance * SCORE_WEIGHTS.balance
+  return { valueSum, boxesWon, total: { you: total('you'), ai: total('ai') } }
+}
+
+// Greedy 1-ply AI: values completing a box highest, then favors higher
+// digits and any twin/balance link the move would create right now, with a
+// mild preference for fuller boxes. Also penalizes leaving a box at 6/7
+// filled unless this move is the one completing it — handing the human a
+// free completion next turn is the single biggest unforced error available.
+function chooseAiMove(values, owners, boxesByTile, boxes, adj) {
+  let best = null
+  let bestScore = -Infinity
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (values[i]) continue
+    const boxId = boxesByTile[i]
+    const boxTiles = boxes.get(boxId)
+    const digits = legalDigits(values, boxTiles, i)
+    const filledInBox = boxTiles.filter((j) => values[j]).length
+    for (const d of digits) {
+      const completes = filledInBox + 1 === BOX_SIZE
+      const { twin, balance } = linkPreview(i, d, 'ai', values, owners, adj)
+      const gifts = !completes && filledInBox + 1 === BOX_SIZE - 1 ? 1 : 0
+      const score = (completes ? 1000 : 0) + d * 50 + twin * 300 + balance * 150 + filledInBox * 10 - gifts * 400
+      if (score > bestScore) {
+        bestScore = score
+        best = { tileIdx: i, digit: d }
+      }
+    }
+  }
+  return best
+}
+
+function emptyBoard() {
+  return { values: {}, owners: {}, completedBy: {} }
+}
+
+function applyMove(board, tileIdx, digit, player, boxId, boxTiles) {
+  const values = { ...board.values, [tileIdx]: digit }
+  const owners = { ...board.owners, [tileIdx]: player }
+  const completedBy = { ...board.completedBy }
+  if (boxTiles.every((i) => values[i])) completedBy[boxId] = player
+  return { values, owners, completedBy }
+}
+
+export default function FlakeWars() {
+  const canvasRef = useRef(null)
+  const containerRef = useRef(null)
+  const [size, setSize] = useState({ w: 600, h: 600 })
+  const [board, setBoard] = useState(emptyBoard)
+  const [turn, setTurn] = useState('you')
+  const [gameOver, setGameOver] = useState(false)
+  const [selectedCell, setSelectedCell] = useState(null)
+  const [round, setRound] = useState(0)
+  const colors = useMemo(digitPalette, [])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect
+      setSize({ w: Math.max(1, Math.round(width)), h: Math.max(1, Math.round(height)) })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const r = Math.max(30, Math.min(size.w, size.h) * 0.42)
+  const tiles = useMemo(
+    () => buildHexaflake(size.w / 2, size.h / 2, r, 2),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [r, size.w, size.h, round],
+  )
+  const boxes = useMemo(() => groupByBox(tiles), [tiles])
+  const boxesByTile = useMemo(() => tiles.map((t) => t.box), [tiles])
+  const adj = useMemo(() => buildAdjacency(tiles), [tiles])
+
+  const links = computeLinkTotals(board.values, board.owners, adj)
+  const scores = computeScores(board.values, board.owners, board.completedBy, links)
+
+  const selectedLegal = selectedCell != null ? legalDigits(board.values, boxes.get(boxesByTile[selectedCell]), selectedCell) : []
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = size.w * dpr
+    canvas.height = size.h * dpr
+    canvas.style.width = size.w + 'px'
+    canvas.style.height = size.h + 'px'
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    ctx.fillStyle = PAPER
+    ctx.fillRect(0, 0, size.w, size.h)
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i]
+      ctx.beginPath()
+      ctx.moveTo(t.verts[0][0], t.verts[0][1])
+      for (let k = 1; k < t.verts.length; k++) ctx.lineTo(t.verts[k][0], t.verts[k][1])
+      ctx.closePath()
+      const v = board.values[i]
+      ctx.fillStyle = v ? colors[v - 1] : '#ffffff'
+      ctx.fill()
+
+      const owner = board.owners[i]
+      if (selectedCell === i) {
+        ctx.strokeStyle = SELECT_COLOR
+        ctx.lineWidth = 3
+      } else if (owner) {
+        ctx.strokeStyle = owner === 'you' ? YOU_COLOR : AI_COLOR
+        ctx.lineWidth = 2.5
+      } else {
+        ctx.strokeStyle = 'rgba(32,34,44,0.25)'
+        ctx.lineWidth = 1
+      }
+      ctx.stroke()
+    }
+  }, [tiles, board, size, colors, selectedCell])
+
+  function aiTurn(currentBoard) {
+    const move = chooseAiMove(currentBoard.values, currentBoard.owners, boxesByTile, boxes, adj)
+    if (!move) {
+      setGameOver(true)
+      return
+    }
+    const boxId = boxesByTile[move.tileIdx]
+    const next = applyMove(currentBoard, move.tileIdx, move.digit, 'ai', boxId, boxes.get(boxId))
+    setBoard(next)
+    if (!anyLegalMove(next.values, boxesByTile, boxes)) setGameOver(true)
+    else setTurn('you')
+  }
+
+  useEffect(() => {
+    if (turn !== 'ai' || gameOver) return
+    const t = setTimeout(() => aiTurn(board), 500)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver])
+
+  function handleCanvasClick(e) {
+    if (turn !== 'you' || gameOver) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    for (let i = tiles.length - 1; i >= 0; i--) {
+      if (!pointInPolygon([x, y], tiles[i].verts)) continue
+      if (board.values[i]) return
+      setSelectedCell((cur) => (cur === i ? null : i))
+      return
+    }
+  }
+
+  function commitDigit(digit) {
+    if (selectedCell == null || turn !== 'you' || gameOver) return
+    if (!selectedLegal.includes(digit)) return
+    const boxId = boxesByTile[selectedCell]
+    const next = applyMove(board, selectedCell, digit, 'you', boxId, boxes.get(boxId))
+    setBoard(next)
+    setSelectedCell(null)
+    if (!anyLegalMove(next.values, boxesByTile, boxes)) setGameOver(true)
+    else setTurn('ai')
+  }
+
+  function newGame() {
+    setBoard(emptyBoard())
+    setTurn('you')
+    setGameOver(false)
+    setSelectedCell(null)
+    setRound((n) => n + 1)
+  }
+
+  const winner = gameOver && (scores.total.you !== scores.total.ai ? (scores.total.you > scores.total.ai ? 'you' : 'ai') : 'draw')
+
+  return (
+    <div className="mode rosette-mode">
+      <div className="canvas-wrap" ref={containerRef}>
+        <canvas ref={canvasRef} onPointerDown={handleCanvasClick} />
+        {gameOver && (
+          <div className="complete-banner">
+            <span>
+              {winner === 'draw' ? 'Draw' : winner === 'you' ? 'You win' : 'AI wins'} — {scores.total.you} to {scores.total.ai}
+            </span>
+            <button onClick={newGame}>New game</button>
+          </div>
+        )}
+      </div>
+      <div className="controls">
+        <div className="status-row">
+          <span className="seed-name">{gameOver ? 'Game over' : turn === 'you' ? 'Your move' : 'AI thinking…'}</span>
+          <span className="progress">score {scores.total.you}-{scores.total.ai}</span>
+          <button className="text-btn" onClick={newGame}>New game</button>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>value {scores.valueSum.you}-{scores.valueSum.ai} · boxes {scores.boxesWon.you}-{scores.boxesWon.ai}</span>
+          <span>twin {links.you.twin}-{links.ai.twin} · balance {links.you.balance}-{links.ai.balance}</span>
+        </div>
+        <div className="palette-bar">
+          {colors.map((c, i) => {
+            const digit = i + 1
+            const legal = selectedLegal.includes(digit)
+            const preview = legal ? linkPreview(selectedCell, digit, 'you', board.values, board.owners, adj) : { twin: 0, balance: 0 }
+            return (
+              <button
+                key={c}
+                className="swatch digit-swatch"
+                disabled={!legal}
+                style={{
+                  background: c,
+                  opacity: legal ? 1 : 0.25,
+                  boxShadow: preview.twin ? `0 0 0 3px ${YOU_COLOR}` : preview.balance ? '0 0 0 3px #5cbba3' : 'none',
+                }}
+                aria-label={`Place ${digit}`}
+                onClick={() => commitDigit(digit)}
+              />
+            )
+          })}
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          {selectedCell == null ? 'Tap an empty cell to see its legal values' : 'Gold ring = twin link · green ring = balance link'}
+        </div>
+      </div>
+    </div>
+  )
+}

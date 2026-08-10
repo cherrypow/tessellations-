@@ -1,0 +1,370 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { buildHexaflake, buildAdjacency } from '../lib/hexaflake'
+import { pointInPolygon } from '../lib/geom'
+
+// The board's numbers are fixed at generation — every cell gets a value
+// before play starts and it never changes. Turns are about WHICH cell you
+// claim, never what to write there. That's a deliberate pivot away from an
+// earlier version where players freely chose any legal 1-7 per cell: once
+// digit choice is free, "always place the biggest legal number" is simply
+// the dominant move (nothing stops you from placing a 7 in every box), so
+// digit magnitude ended up doing all the deciding and nothing else did.
+// With values fixed and public from turn one, the game becomes genuinely
+// spatial — you can see every number on the board and have to fight over
+// which CELLS matter, including denying your opponent one.
+//
+// Generation still respects the Sudoku shape (each of the 7 boxes gets a
+// random permutation of 1-7 — see hexaflake.js for why a box is exactly
+// one branch's 7 leaf children) purely so every value appears exactly once
+// per box; there's no legality check during play anymore, since nothing is
+// being placed.
+//
+// Each player's OWN claims also alternate between two shades automatically
+// — your 1st claim is dark, 2nd is light, 3rd dark again, tracked by that
+// player's own move count, not global turn number. A link additionally
+// requires matching shade, not just matching owner — so you can't just
+// grab any two cells of your color; you have to plan around which shade
+// your NEXT claim will land as. That's the real strategic layer: the board
+// is fully visible from move one, but timing your own alternation against
+// it is not.
+//
+// Two link bonuses reward CROSS-box adjacency specifically (see
+// buildAdjacency in hexaflake.js for the neighbor graph) — same-box
+// neighbors are excluded on purpose: every box always contains all of
+// 1-7, so same-box siblings are guaranteed to include complementary pairs
+// (1&7, 2&6, 3&5) that have nothing to do with cross-board positioning and
+// would otherwise flood "balance" with meaningless noise.
+//   - twin link: two SAME-owner, SAME-shade cells, adjacent across a box
+//     boundary, with the SAME value.
+//   - balance link: two SAME-owner, SAME-shade cells, adjacent across a
+//     box boundary, with values summing to 8 (4 has no partner).
+const PAPER = '#eeeee6'
+const TWIN_BADGE = '#cba24a'
+const BALANCE_BADGE = '#5cbba3'
+const BOX_SIZE = 7
+const SCORE_WEIGHTS = { cell: 1, box: 10, twin: 15, balance: 8 }
+
+// Two shades per player — shade encodes turn-parity, not value. The value
+// is carried entirely by the digit text now, decoupled from color.
+const SHADES = {
+  you: { dark: '#1e4a73', light: '#5b8fc4' },
+  ai: { dark: '#3a3c40', light: '#8b8e93' },
+}
+
+function nextShade(moveCount) {
+  return moveCount % 2 === 0 ? 'dark' : 'light'
+}
+
+function groupByBox(tiles) {
+  const map = new Map()
+  tiles.forEach((t, i) => {
+    if (!map.has(t.box)) map.set(t.box, [])
+    map.get(t.box).push(i)
+  })
+  return map
+}
+
+function shuffle(arr) {
+  const a = [...arr]
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[a[i], a[j]] = [a[j], a[i]]
+  }
+  return a
+}
+
+function countCrossBoxOpportunities(fixedValues, tiles, adj) {
+  let twin = 0, balance = 0
+  const seen = new Set()
+  for (let i = 0; i < adj.length; i++) {
+    for (const j of adj[i]) {
+      if (tiles[i].box === tiles[j].box) continue
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (fixedValues[i] === fixedValues[j]) twin++
+      else if (fixedValues[i] + fixedValues[j] === 8) balance++
+    }
+  }
+  return twin + balance
+}
+
+// Random per-box permutation, rerolled (a handful of times, not forever) if
+// it happens to land zero cross-box opportunities — rare (~2% empirically)
+// but a board with literally nothing to fight over isn't worth dealing.
+function generateFixedValues(boxes, tiles, adj) {
+  let best = null
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const values = {}
+    for (const idxs of boxes.values()) {
+      const perm = shuffle([1, 2, 3, 4, 5, 6, 7])
+      idxs.forEach((idx, k) => { values[idx] = perm[k] })
+    }
+    if (countCrossBoxOpportunities(values, tiles, adj) > 0) return values
+    best = values
+  }
+  return best
+}
+
+// What links would claiming `cellIdx` create RIGHT NOW for `player`, if it
+// lands as `shade`? Only counts against the player's own existing cells of
+// the SAME shade — a dark cell next to your own light cell is not a link.
+function linkPreview(cellIdx, player, shade, owners, shades, fixedValues, tiles, adj) {
+  let twin = 0, balance = 0
+  const v = fixedValues[cellIdx]
+  for (const n of adj[cellIdx]) {
+    if (tiles[n].box === tiles[cellIdx].box) continue
+    if (owners[n] !== player || shades[n] !== shade) continue
+    if (fixedValues[n] === v) twin++
+    else if (fixedValues[n] + v === 8) balance++
+  }
+  return { twin, balance }
+}
+
+function computeLinkTotals(fixedValues, owners, shades, tiles, adj) {
+  const totals = { you: { twin: 0, balance: 0 }, ai: { twin: 0, balance: 0 } }
+  const seen = new Set()
+  for (let i = 0; i < adj.length; i++) {
+    if (!owners[i]) continue
+    for (const j of adj[i]) {
+      if (tiles[i].box === tiles[j].box) continue
+      if (!owners[j] || owners[i] !== owners[j] || shades[i] !== shades[j]) continue
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const p = owners[i]
+      if (fixedValues[i] === fixedValues[j]) totals[p].twin++
+      else if (fixedValues[i] + fixedValues[j] === 8) totals[p].balance++
+    }
+  }
+  return totals
+}
+
+function computeScores(owners, completedBy, links) {
+  const cells = { you: 0, ai: 0 }
+  for (const p of Object.values(owners)) cells[p]++
+  const boxesWon = { you: 0, ai: 0 }
+  for (const p of Object.values(completedBy)) boxesWon[p]++
+  const total = (p) =>
+    cells[p] * SCORE_WEIGHTS.cell + boxesWon[p] * SCORE_WEIGHTS.box + links[p].twin * SCORE_WEIGHTS.twin + links[p].balance * SCORE_WEIGHTS.balance
+  return { cells, boxesWon, total: { you: total('you'), ai: total('ai') } }
+}
+
+// Greedy 1-ply AI over WHICH cell to claim (values are fixed and shade is
+// forced by its own move count, so there's no free decision except the
+// cell itself): take an immediate box completion first, else the biggest
+// combination of links this claim creates for itself PLUS links it denies
+// the human by taking the cell out from under them — evaluated against
+// each side's actual upcoming shade, not just "any same-owner cell" — with
+// a defensive penalty for leaving a box at 6/7 unless this move finishes it.
+function chooseAiMove(fixedValues, owners, shades, boxesByTile, boxes, tiles, adj, aiShade, youShade) {
+  let best = null
+  let bestScore = -Infinity
+  for (let i = 0; i < boxesByTile.length; i++) {
+    if (owners[i]) continue
+    const boxId = boxesByTile[i]
+    const boxTiles = boxes.get(boxId)
+    const filledInBox = boxTiles.filter((j) => owners[j]).length
+    const completes = filledInBox + 1 === BOX_SIZE
+    const gifts = !completes && filledInBox + 1 === BOX_SIZE - 1 ? 1 : 0
+    const own = linkPreview(i, 'ai', aiShade, owners, shades, fixedValues, tiles, adj)
+    const denied = linkPreview(i, 'you', youShade, owners, shades, fixedValues, tiles, adj)
+    const score =
+      (completes ? 1000 : 0) + own.twin * 300 + own.balance * 150 + (denied.twin + denied.balance) * 120 + filledInBox * 10 - gifts * 400
+    if (score > bestScore) {
+      bestScore = score
+      best = i
+    }
+  }
+  return best
+}
+
+function centroidOf(verts) {
+  let x = 0, y = 0
+  for (const [px, py] of verts) { x += px; y += py }
+  return [x / verts.length, y / verts.length]
+}
+
+function textColorFor(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16)
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return luminance > 0.55 ? '#20222c' : '#f5f3ee'
+}
+
+function emptyClaims() {
+  return { owners: {}, shades: {}, moveCount: { you: 0, ai: 0 }, completedBy: {} }
+}
+
+function applyClaim(claims, tileIdx, player, boxId, boxTiles) {
+  const shade = nextShade(claims.moveCount[player])
+  const owners = { ...claims.owners, [tileIdx]: player }
+  const shades = { ...claims.shades, [tileIdx]: shade }
+  const moveCount = { ...claims.moveCount, [player]: claims.moveCount[player] + 1 }
+  const completedBy = { ...claims.completedBy }
+  if (boxTiles.every((i) => owners[i])) completedBy[boxId] = player
+  return { owners, shades, moveCount, completedBy }
+}
+
+export default function FlakeWars() {
+  const canvasRef = useRef(null)
+  const containerRef = useRef(null)
+  const [size, setSize] = useState({ w: 600, h: 600 })
+  const [claims, setClaims] = useState(emptyClaims)
+  const [turn, setTurn] = useState('you')
+  const [gameOver, setGameOver] = useState(false)
+  const [round, setRound] = useState(0)
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect
+      setSize({ w: Math.max(1, Math.round(width)), h: Math.max(1, Math.round(height)) })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const r = Math.max(30, Math.min(size.w, size.h) * 0.42)
+  const tiles = useMemo(
+    () => buildHexaflake(size.w / 2, size.h / 2, r, 2),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [r, size.w, size.h],
+  )
+  const boxes = useMemo(() => groupByBox(tiles), [tiles])
+  const boxesByTile = useMemo(() => tiles.map((t) => t.box), [tiles])
+  const adj = useMemo(() => buildAdjacency(tiles), [tiles])
+  const fixedValues = useMemo(
+    () => generateFixedValues(boxes, tiles, adj),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boxes, tiles, adj, round],
+  )
+
+  const links = computeLinkTotals(fixedValues, claims.owners, claims.shades, tiles, adj)
+  const scores = computeScores(claims.owners, claims.completedBy, links)
+  const cellsClaimed = Object.keys(claims.owners).length
+  const yourNextShade = nextShade(claims.moveCount.you)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const dpr = window.devicePixelRatio || 1
+    canvas.width = size.w * dpr
+    canvas.height = size.h * dpr
+    canvas.style.width = size.w + 'px'
+    canvas.style.height = size.h + 'px'
+    const ctx = canvas.getContext('2d')
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+    ctx.fillStyle = PAPER
+    ctx.fillRect(0, 0, size.w, size.h)
+
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i]
+      ctx.beginPath()
+      ctx.moveTo(t.verts[0][0], t.verts[0][1])
+      for (let k = 1; k < t.verts.length; k++) ctx.lineTo(t.verts[k][0], t.verts[k][1])
+      ctx.closePath()
+      const v = fixedValues[i]
+      const owner = claims.owners[i]
+      const shade = claims.shades[i]
+      const fill = owner ? SHADES[owner][shade] : '#ffffff'
+      ctx.fillStyle = fill
+      ctx.fill()
+
+      ctx.strokeStyle = 'rgba(32,34,44,0.25)'
+      ctx.lineWidth = 1
+      ctx.stroke()
+
+      const [cx, cy] = centroidOf(t.verts)
+      const leafR = Math.hypot(t.verts[0][0] - cx, t.verts[0][1] - cy)
+      ctx.fillStyle = owner ? textColorFor(fill) : '#20222c'
+      ctx.font = `700 ${Math.round(leafR * 0.62)}px ui-monospace, "SF Mono", "Cascadia Code", monospace`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(String(v), cx, cy + leafR * 0.03)
+    }
+  }, [tiles, fixedValues, claims, size])
+
+  function aiTurn(currentClaims) {
+    const aiShade = nextShade(currentClaims.moveCount.ai)
+    const youShade = nextShade(currentClaims.moveCount.you)
+    const tileIdx = chooseAiMove(fixedValues, currentClaims.owners, currentClaims.shades, boxesByTile, boxes, tiles, adj, aiShade, youShade)
+    if (tileIdx == null) {
+      setGameOver(true)
+      return
+    }
+    const boxId = boxesByTile[tileIdx]
+    const next = applyClaim(currentClaims, tileIdx, 'ai', boxId, boxes.get(boxId))
+    setClaims(next)
+    if (Object.keys(next.owners).length >= tiles.length) setGameOver(true)
+    else setTurn('you')
+  }
+
+  useEffect(() => {
+    if (turn !== 'ai' || gameOver) return
+    const t = setTimeout(() => aiTurn(claims), 500)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turn, gameOver])
+
+  function handleCanvasClick(e) {
+    if (turn !== 'you' || gameOver) return
+    const rect = canvasRef.current.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    for (let i = tiles.length - 1; i >= 0; i--) {
+      if (!pointInPolygon([x, y], tiles[i].verts)) continue
+      if (claims.owners[i]) return
+      const boxId = boxesByTile[i]
+      const next = applyClaim(claims, i, 'you', boxId, boxes.get(boxId))
+      setClaims(next)
+      if (Object.keys(next.owners).length >= tiles.length) setGameOver(true)
+      else setTurn('ai')
+      return
+    }
+  }
+
+  function newGame() {
+    setClaims(emptyClaims())
+    setTurn('you')
+    setGameOver(false)
+    setRound((n) => n + 1)
+  }
+
+  const winner = gameOver && (scores.total.you !== scores.total.ai ? (scores.total.you > scores.total.ai ? 'you' : 'ai') : 'draw')
+
+  return (
+    <div className="mode rosette-mode">
+      <div className="canvas-wrap" ref={containerRef}>
+        <canvas ref={canvasRef} onPointerDown={handleCanvasClick} />
+        {gameOver && (
+          <div className="complete-banner">
+            <span>
+              {winner === 'draw' ? 'Draw' : winner === 'you' ? 'You win' : 'AI wins'} — {scores.total.you} to {scores.total.ai}
+            </span>
+            <button onClick={newGame}>New game</button>
+          </div>
+        )}
+      </div>
+      <div className="controls">
+        <div className="status-row">
+          <span className="seed-name">{gameOver ? 'Game over' : turn === 'you' ? 'Your move' : 'AI thinking…'}</span>
+          <span className="progress">score {scores.total.you}-{scores.total.ai} · {cellsClaimed}/{tiles.length}</span>
+          <button className="text-btn" onClick={newGame}>New game</button>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>boxes {scores.boxesWon.you}-{scores.boxesWon.ai}</span>
+          <span style={{ color: TWIN_BADGE }}>twin {links.you.twin}-{links.ai.twin}</span>
+          <span style={{ color: BALANCE_BADGE }}>balance {links.you.balance}-{links.ai.balance}</span>
+        </div>
+        <div className="status-row" style={{ fontSize: 11 }}>
+          <span>
+            Next tile: <span style={{ color: SHADES.you[yourNextShade], fontWeight: 700 }}>{yourNextShade}</span>
+          </span>
+          <span>Same owner + same shade + matching/complementary number, across a flower, scores a link.</span>
+        </div>
+      </div>
+    </div>
+  )
+}

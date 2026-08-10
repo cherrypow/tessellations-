@@ -1,0 +1,18 @@
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #12131c;
+  color: #e9e8ea;
+  font-family: -apple-system, "SF Pro Text", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
